@@ -1,0 +1,45 @@
+{
+  "name": "simple-react-app",
+  "version": "1.0.0",
+  "description": "低配版react-webpack脚手架，快速搭建react基础环境，用于react相关测试。",
+  "main": "index.js",
+  "scripts": {
+    "build": "webpack --mode production",
+    "start": "webpack-dev-server",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whosMeya/simple-react-app.git"
+  },
+  "keywords": [
+    "simple-react-app",
+    "react",
+    "webpack",
+    "babel"
+  ],
+  "author": "whosmeya",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/whosMeya/simple-react-app/issues"
+  },
+  "homepage": "https://github.com/whosMeya/simple-react-app#readme",
+  "devDependencies": {
+    "@babel/core": "^7.9.0",
+    "@babel/plugin-proposal-class-properties": "^7.8.3",
+    "@babel/polyfill": "^7.8.7",
+    "@babel/preset-env": "^7.9.5",
+    "@babel/preset-react": "^7.9.4",
+    "babel-loader": "^8.1.0",
+    "html-webpack-plugin": "^4.2.0",
+    "webpack": "^4.42.1",
+    "webpack-cli": "^3.3.11",
+    "webpack-dev-server": "^3.10.3"
+  },
+  "dependencies": {
+    "@types/react": "^16.9.34",
+    "@types/react-dom": "^16.9.6",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1"
+  }
+}
