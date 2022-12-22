@@ -1,0 +1,16 @@
+name: Pull Request Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [dev,main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Check if the pull request was merged
+      - name: Check if PR was merged
+        if: github.event.pull_request.merged == true
+        run: echo "Pull request was merged"
+      

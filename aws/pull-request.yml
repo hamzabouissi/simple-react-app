@@ -1,0 +1,521 @@
+Parameters:
+  RootDomainName:
+    Type: String
+    Default: pengguin.com
+  HostedZoneId:
+    Type: String
+    Default: ""
+
+  
+Resources:
+
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub ${AWS::StackName}-s3-origin-oai
+
+  ArtifactBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: "front-end-preview-bucket-pengguin"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  PengguinFrontPreviewBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentity}
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${LambdaRole}
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ArtifactBucket}/*
+          - Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${LambdaRole}
+            Action: 
+              - s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${ArtifactBucket}
+          
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: frontend_build_on_pull
+      RetentionInDays: 7
+  PublicReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+
+  PublicReadPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: PublicBuildPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:GetLogEvents"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${BuildLogGroup}:*"
+          - Effect: Allow
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+            Resource:
+              - Fn::Sub:
+                - "${ArtifcatArn}/*"
+                - {ArtifcatArn: !GetAtt ArtifactBucket.Arn}
+      Roles:
+        - !Ref PublicReadRole
+
+
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      
+  BuildProjectPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: BuildProjectRole
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-CodeBuildPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:BatchPutCodeCoverages
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetObjectVersion
+            # TODO: This might not be necessary. We may only need the bucket
+            # that is in the same region as the pipeline.
+            # Loop through all the artifact buckets created in the stackset
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              # TODO: scope this down if possible
+              - kms:*
+            # TODO: This might not be necessary. We may only need the KMS key
+            # that is in the same region as the pipeline.
+            # Loop through all the KMS keys used to en/decrypt artifacts
+            # across (cross-regional) pipeline stages, with each stage
+            # backed by a (regional) S3 bucket.
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - secretsmanager:*
+            Resource: "*"
+      Roles:
+        - !Ref BuildProjectRole
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: FrontBuildOnPull
+      ServiceRole: !GetAtt BuildProjectRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref BuildLogGroup
+          Status: ENABLED
+          StreamName: front_pull_request
+      EncryptionKey: "alias/aws/s3"
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Name: FrontPullRequest
+        OverrideArtifactName: true
+        EncryptionDisabled: true
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        EnvironmentVariables: 
+          - Name: Environment
+            Type: PLAINTEXT
+            Value: dev
+      Source:
+        Type: GITHUB
+        Location: "https://github.com/pengguin-net/web-frontend"
+        ReportBuildStatus: true
+      Triggers:
+        BuildType: BUILD
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED
+      Visibility: PUBLIC_READ
+      ResourceAccessRole: !Ref PublicReadRole
+
+
+
+  SlackNotification:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties: 
+      DetailType: BASIC
+      EventTypeIds: 
+        - codebuild-project-build-state-succeeded
+        - codebuild-project-build-state-failed
+      Name: PullRequestBuildNotificationFrontEnd
+      Resource: !GetAtt CodeBuildProject.Arn
+      Targets:
+        - TargetAddress: "arn:aws:chatbot::021338898563:chat-configuration/slack-channel/Slack"
+          TargetType: AWSChatbotSlack
+
+
+  OriginResponseLambdaBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: "origin-response-lambda-bucket"
+  
+
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'lambda.amazonaws.com'
+            - 'edgelambda.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:GetObjectVersion"
+                Resource:
+                  - Fn::Sub:
+                    - "${ArtifcatArn}/*"
+                    - {ArtifcatArn: !GetAtt ArtifactBucket.Arn}
+                  - Fn::Sub:
+                    - "${OriginResponseLambdaBucket}/*"
+                    - {OriginResponseLambdaBucket: !GetAtt OriginResponseLambdaBucket.Arn}
+              - Effect: Allow
+                Action:
+                  - "cloudfront:CreateInvalidation"
+                  - "cloudfront:GetDistribution"
+                  - "cloudfront:GetDistributionConfig"
+                Resource: "*" # circular dependecy if allow only cloudfront
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  
+
+  rLG:
+    Type: AWS::Logs::LogGroup
+    DependsOn: LambdaFunction
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cloudfront_lambda"
+      RetentionInDays: 7
+
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "cloudfront_lambda"
+      Code:
+        ZipFile: !Sub |
+          import re
+          import boto3 
+
+          def handler(event, context):
+              client = boto3.client("s3")
+              bucket = "front-end-preview-bucket-pengguin"
+              response = client.list_objects_v2(Bucket=bucket,Prefix="pr/",Delimiter="/")
+              prs  = [ p['Prefix'].split('/')[1] for p in response['CommonPrefixes']]
+
+              request = event['Records'][0]['cf']['request']
+              print(request)
+
+              headers = request['headers']
+              pr = headers.get('pull-request',None)
+              
+              print(request['uri'])              
+              
+              if pr is None:
+                print(f"{pr} not found")
+                response = {
+                  'status': '404',
+                  'statusDescription': 'No Found',
+                }
+                return response
+              
+              pr = pr[0]['value']
+
+              if not pr.isdigit() or not (pr in prs):
+                print(f"{pr} not good")
+                response = {
+                  'status': '404',
+                  'statusDescription': 'No Found',
+                }
+                return response
+
+              pr = int(pr)
+              request['uri'] = f"/pr/{pr}{request['uri']}"
+
+              print(request)
+              return request
+
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'python3.9'
+      Timeout: 5
+      
+
+
+  VersionedLambdaFunction14:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Description: v14
+
+
+  OriginResponseLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "cloudfront_lambda_origin_response"
+      Code:
+        S3Bucket: !Ref OriginResponseLambdaBucket
+        S3Key: function.zip
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'python3.9'
+      Timeout: 5
+
+
+  VersionedOriginResponseLambda:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref OriginResponseLambda
+      Description: v1
+
+
+
+  DistributionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: pullrequest.distributionlogs
+
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Sub 'preview.${RootDomainName}'
+        Origins:
+          - DomainName: !Sub ${ArtifactBucket}.s3.${AWS::Region}.amazonaws.com
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${OriginAccessIdentity}
+        Enabled: true
+        DefaultRootObject: index.html
+        Logging:
+          Bucket: !Sub ${DistributionBucket}.s3.${AWS::Region}.amazonaws.com
+        # CustomErrorResponses:
+        #   - ErrorCachingMinTTL: 300
+        #     ErrorCode: 403
+        #     ResponseCode: 200
+        #     ResponsePagePath: /index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref DistributionCachingPolicy
+          LambdaFunctionAssociations:
+            - EventType: 'origin-request'
+              LambdaFunctionARN: !Ref VersionedLambdaFunction14
+            - EventType: 'origin-response'
+              LambdaFunctionARN: !Ref VersionedOriginResponseLambda
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: 
+            Fn::ImportValue:
+              'front-acm-certificate-CertificateArn'
+          SslSupportMethod: sni-only
+
+  DistributionCachingPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig: 
+        Comment: "Allow pass of header and query params to cloudfront"
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 80400
+        Name: CacheForHeaderAndQuery
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingGzip: false
+          HeadersConfig: 
+            HeaderBehavior: whitelist
+            Headers: 
+              - pull-request
+          QueryStringsConfig: 
+            QueryStringBehavior: all
+              
+            
+
+
+
+
+  
+  HostedZoneRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Sub "preview.${RootDomainName}"
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+        - Name: !Sub www.preview.${RootDomainName}
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+        - Name: !Sub "preview.${RootDomainName}"
+          Type: AAAA
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+        - Name: !Sub "www.preview.${RootDomainName}"
+          Type: AAAA
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+  
+
+  EventCloudFrontLambda:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Invalidate Cloudfront after successfull build
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          build-status:
+            - SUCCEEDED
+          project-name:
+            - !Ref CodeBuildProject
+      Targets: 
+        - 
+          Arn: !GetAtt InvalidateCloudFront.Arn 
+          Id: "TargetFunctionV1"
+
+  InvalidateCloudFront:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "invalidate_cloudfront_from_codebuild_lambda"
+      Environment:
+        Variables:
+          DistributionId: !GetAtt  Distribution.Id
+      Code:
+        ZipFile: !Sub |
+          import boto3 
+          import uuid
+          import os
+
+          def handler(event, context):
+              print(event)
+              artifict = event['detail']['additional-information']['artifact']['location']
+              pr = artifict.split("/")[2]
+
+              distribution_id = os.getenv("DistributionId")
+
+              print(distribution_id)
+
+              client = boto3.client("cloudfront")
+              response = client.create_invalidation(
+                  DistributionId=distribution_id,
+                  InvalidationBatch={
+                      'Paths': {
+                          'Quantity': 1,
+                          'Items': [
+                              f'/pr/{pr}/*',
+                          ]
+                      },
+                      'CallerReference': str(uuid.uuid4())
+                  }
+              )
+
+              return {"status":200}
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'python3.9'
+      Timeout: 5
+
+  InvalidateCloudFrontLogs:
+    Type: AWS::Logs::LogGroup
+    DependsOn: InvalidateCloudFront
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${InvalidateCloudFront}"
+      RetentionInDays: 7
+  
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref InvalidateCloudFront
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventCloudFrontLambda.Arn
